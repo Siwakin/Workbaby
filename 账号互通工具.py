@@ -50,6 +50,7 @@ import stat
 import math
 import shutil
 import sqlite3
+import zipfile
 import datetime
 import subprocess
 import threading
@@ -90,7 +91,7 @@ except Exception:                                    # pragma: no cover
 APP_TITLE = "WorkBaby 账号及会话管理助手"
 # ★ 版本号规则（2026-10-26 用户约定）：小更新末位 +1 → v3.02、v3.03 …
 #   大改版才跳到 v4.0。exe 文件名同步带这个号，便于区分新旧。
-APP_VER = "v3.12"
+APP_VER = "v3.13"
 
 # ---- 界面配色（科技风 · 冷黑底 + 青色冷光，v3.05 重新校准）
 #
@@ -663,6 +664,253 @@ def do_copy(ids, target, log):
     finally:
         con.close()
     log("复制完成：%d 个会话已分身给 %s" % (len(ids), short_uid(target)))
+
+
+# ---------------------------------------------------------------- 会话跨机导出 / 导入
+#
+# 一条会话在本机由三部分组成，导出必须三样都带上：
+#   1) workbuddy.db 的 sessions 行（40 个字段：标题 / cwd / 模型 / 权限模式 …）
+#   2) 聊天底稿  <projects>/<项目目录>/<会话ID>.jsonl
+#   3) 附属文件  <会话ID>.file-rollback.ndjson 和 <会话ID>/ 目录（产物、附件）
+# 打包成 .wbsession（就是标准 zip，不加密）—— 里面只有聊天记录，没有任何登录凭证。
+
+SESS_PKG_FORMAT = "workbaby-session"
+SESS_PKG_VER = 1
+SESS_PKG_EXT = ".wbsession"
+
+
+def project_dir_name(cwd):
+    r"""由 sessions.cwd 正推 projects 下的目录名。
+
+    必须与 project_dir_for 的反推规则逐字一致（盘符小写 + 去冒号 + 分隔符换 -），
+    否则新机器上建出来的目录对不上，应用找不到底稿。
+    导入时目标目录还不存在，反推是推不出来的，只能正着算。
+    """
+    if not cwd:
+        return ""
+    return cwd[0].lower() + cwd[1:].replace(":", "").replace("/", "-").replace("\\", "-")
+
+
+def _sess_files(sid, pj):
+    """列出一条会话在 projects 目录下的全部附属文件：[(相对路径, 绝对路径)]。"""
+    out = []
+    if not pj or not os.path.isdir(pj):
+        return out
+    for suf in (".jsonl", ".file-rollback.ndjson"):
+        p = os.path.join(pj, sid + suf)
+        if os.path.exists(p):
+            out.append((sid + suf, p))
+    d = os.path.join(pj, sid)
+    if os.path.isdir(d):
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                ap = os.path.join(root, f)
+                out.append((os.path.relpath(ap, pj).replace("\\", "/"), ap))
+    return out
+
+
+def export_sessions(ids, out_path, log=None):
+    """把选中的会话打包成 .wbsession。只读，不需要退出 WorkBuddy。
+
+    返回 (成功条数, 跳过列表[(标题, 原因)], 原始总字节)。
+    """
+    log = log or (lambda m: None)
+    con = ro_connect()
+    items, skipped, paths = [], [], {}
+    raw_bytes = 0
+    try:
+        for sid in ids:
+            r = con.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+            if not r:
+                skipped.append((short_uid(sid), "数据库里找不到这一行"))
+                continue
+            d = dict(r)
+            title = d.get("custom_title") or d.get("title") or short_uid(sid)
+            if d.get("transport") == "cloud":
+                skipped.append((title, "云端会话，内容在服务器上，本地没有底稿"))
+                continue
+            pj = project_dir_for(d.get("cwd") or "")
+            fl = _sess_files(sid, pj)
+            if not any(rel.endswith(".jsonl") for rel, _ in fl):
+                skipped.append((title, "找不到聊天底稿（可能已被清理）"))
+                continue
+            u = con.execute("SELECT used,size,updated_at,credit_json "
+                            "FROM session_usage WHERE session_id=?", (sid,)).fetchone()
+            items.append({"row": d,
+                          "usage": dict(u) if u else None,
+                          "files": [rel for rel, _ in fl]})
+            paths[sid] = fl
+            raw_bytes += sum(os.path.getsize(ap) for _, ap in fl)
+    finally:
+        con.close()
+
+    if not items:
+        return 0, skipped, 0
+
+    man = {"format": SESS_PKG_FORMAT, "version": SESS_PKG_VER,
+           "exported_at": now_str(), "source_uid": current_uid() or "",
+           "items": items}
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        z.writestr("manifest.json", json.dumps(man, ensure_ascii=False, indent=1))
+        for sid, fl in paths.items():
+            for rel, ap in fl:
+                z.write(ap, "payload/%s/%s" % (sid, rel))
+
+    for t, why in skipped:
+        log("跳过「%s」：%s" % (str(t)[:40], why))
+    log("已导出 %d 个会话 → %s（%.1f MB）"
+        % (len(items), out_path, os.path.getsize(out_path) / 1048576.0))
+    return len(items), skipped, raw_bytes
+
+
+def import_sessions(pkg_path, target_uid, log=None):
+    """把一个 .wbsession 还原到本机，归属到 target_uid。
+
+    顺序：校验包 → 撞 ID 就换新 ID → 按原 cwd 建空目录 → 还原 projects 底稿
+          → 写 sessions / session_usage / workspaces。
+    返回 {"ok": [...], "skipped": [(标题, 原因)], "warnings": [...]}
+    """
+    log = log or (lambda m: None)
+    res = {"ok": [], "skipped": [], "warnings": []}
+
+    try:
+        z = zipfile.ZipFile(pkg_path)
+    except Exception as e:
+        raise RuntimeError("打不开这个文件：%s" % e)
+
+    with z:
+        try:
+            man = json.loads(z.read("manifest.json").decode("utf-8"))
+        except KeyError:
+            raise RuntimeError("不是有效的会话包（缺少 manifest.json）")
+        except Exception as e:
+            raise RuntimeError("manifest.json 读不出来：%s" % e)
+        if man.get("format") != SESS_PKG_FORMAT:
+            raise RuntimeError("这不是 WorkBaby 导出的会话包。")
+        try:
+            ver = int(man.get("version") or 0)
+        except Exception:
+            ver = 0
+        if ver > SESS_PKG_VER:
+            raise RuntimeError("这个包由更新版本导出（v%d），请先升级本工具。" % ver)
+        items = man.get("items") or []
+        if not items:
+            raise RuntimeError("包里没有可导入的会话。")
+
+        con = sqlite3.connect(DB_PATH, timeout=20)
+        try:
+            con.execute("PRAGMA busy_timeout=20000")
+            cur = con.cursor()
+            tcols = [c[1] for c in cur.execute("PRAGMA table_info(sessions)")]
+            ucols = [c[1] for c in cur.execute("PRAGMA table_info(session_usage)")]
+            wcols = [c[1] for c in cur.execute("PRAGMA table_info(workspaces)")]
+            cur.execute("BEGIN IMMEDIATE")
+            for it in items:
+                src = it.get("row") or {}
+                old_id = src.get("id") or ""
+                title = src.get("custom_title") or src.get("title") or short_uid(old_id)
+                title = str(title)[:60]
+
+                if not UID_RE.match(old_id or ""):
+                    res["skipped"].append((title, "会话 ID 格式不对"))
+                    continue
+
+                # 撞 ID：换一个新的，底稿里的引用一起替换（等于导入成副本）
+                new_id = old_id
+                if cur.execute("SELECT 1 FROM sessions WHERE id=?",
+                               (old_id,)).fetchone():
+                    new_id = str(uuid.uuid4())
+                    res["warnings"].append("「%s」本机已存在，本次导入为副本" % title)
+
+                cwd = (src.get("cwd") or "").strip()
+                # 1) 按原路径把工作目录建出来（建不出来只警告，不阻断）
+                if cwd:
+                    try:
+                        if not os.path.isdir(cwd):
+                            os.makedirs(cwd, exist_ok=True)
+                    except Exception as e:
+                        res["warnings"].append(
+                            "工作目录 %s 没能建出来（%s），会话照样导入" % (cwd, e))
+                # 2) 定位并建 projects 目录
+                pj = os.path.join(PROJECTS_DIR, project_dir_name(cwd)) if cwd else ""
+                if not pj:
+                    res["skipped"].append((title, "这条会话没有记录工作目录，无法定位底稿"))
+                    continue
+                try:
+                    os.makedirs(pj, exist_ok=True)
+                except Exception as e:
+                    res["skipped"].append((title, "projects 目录建不出来：%s" % e))
+                    continue
+
+                # 3) 还原附属文件
+                wrote = 0
+                base = os.path.normpath(pj)
+                for rel in (it.get("files") or []):
+                    arc = "payload/%s/%s" % (old_id, rel)
+                    try:
+                        data = z.read(arc)
+                    except KeyError:
+                        res["warnings"].append("包里缺少 %s" % rel)
+                        continue
+                    if new_id != old_id:
+                        rel = rel.replace(old_id, new_id)
+                        data = data.replace(old_id.encode("ascii"),
+                                            new_id.encode("ascii"))
+                    dst = os.path.normpath(os.path.join(pj, rel))
+                    if not dst.startswith(base + os.sep):
+                        res["warnings"].append("跳过可疑路径 %s" % rel)
+                        continue
+                    os.makedirs(os.path.dirname(dst) or pj, exist_ok=True)
+                    with open(dst, "wb") as f:
+                        f.write(data)
+                    wrote += 1
+                if not wrote:
+                    res["skipped"].append((title, "底稿没能解出来"))
+                    continue
+
+                # 4) 写 sessions 行（只取目标库确实有的列，版本不同也不会炸）
+                row = {k: v for k, v in src.items() if k in tcols}
+                row["id"] = new_id
+                row["user_id"] = target_uid
+                if "unread" in row:
+                    row["unread"] = 0
+                for k in ("agent_dirty", "agent_dirty_at", "agent_last_synced"):
+                    if k in row:
+                        row[k] = None
+                names = list(row.keys())
+                cur.execute("INSERT OR REPLACE INTO sessions (%s) VALUES (%s)"
+                            % (",".join(names), ",".join("?" * len(names))),
+                            [row[n] for n in names])
+
+                # 5) 用量行（有就带过来，没有就算了）
+                u = it.get("usage")
+                if u and ucols:
+                    ur = {k: v for k, v in u.items() if k in ucols}
+                    ur["session_id"] = new_id
+                    un = list(ur.keys())
+                    cur.execute("INSERT OR REPLACE INTO session_usage (%s) VALUES (%s)"
+                                % (",".join(un), ",".join("?" * len(un))),
+                                [ur[n] for n in un])
+
+                # 6) 让新机器的工作区列表认识这个目录（workspaces 存的是反斜杠路径）
+                if cwd and wcols == ["path", "last_opened_at"]:
+                    try:
+                        cur.execute("INSERT OR REPLACE INTO workspaces "
+                                    "(path, last_opened_at) VALUES (?, ?)",
+                                    (cwd.replace("/", "\\"),
+                                     int(time.time() * 1000)))
+                    except Exception:
+                        pass
+
+                if src.get("deleted_at"):
+                    res["warnings"].append("「%s」在源机器上已被删除，导入后同样是删除状态" % title)
+                res["ok"].append(title)
+                log("导入「%s」→ %s" % (title, short_uid(new_id)))
+            con.commit()
+        finally:
+            con.close()
+
+    return res
 
 
 def do_move_automation(ids, target, log):
@@ -1763,6 +2011,21 @@ class App(object):
         self.btn_go.pack(side=tk.RIGHT)
         ttk.Label(of, text="提示：想把 B 账号的会话给 A，就把“只看账号”选 B、目标选 A，反之亦然。"
                           "云端会话（传输=cloud）跟随服务器账号，不能本地迁移。",
+                  foreground=C_MUTED).pack(fill=tk.X, **pad)
+
+        # 跨机导出 / 导入
+        ef = ttk.LabelFrame(pg_ses, text=" 跨机导出 / 导入（换电脑时把某条会话带走） ")
+        ef.pack(fill=tk.X, padx=8, pady=4)
+        erow = ttk.Frame(ef)
+        erow.pack(fill=tk.X, **pad)
+        ttk.Button(erow, text="导出勾选的会话…",
+                   command=self.on_export_sessions).pack(side=tk.LEFT)
+        ttk.Button(erow, text="导入会话包…",
+                   command=self.on_import_sessions).pack(side=tk.LEFT, padx=6)
+        ttk.Label(erow, text="导出不用退出 WorkBuddy，导入要退出",
+                  foreground=C_MUTED).pack(side=tk.LEFT, padx=10)
+        ttk.Label(ef, text="导出的 .wbsession 里是完整聊天记录（可读文本），请自行保管。"
+                           "云端会话（传输=cloud）导不出来 —— 它只有索引，内容在服务器上。",
                   foreground=C_MUTED).pack(fill=tk.X, **pad)
 
         # 定时任务面板
@@ -3085,6 +3348,114 @@ class App(object):
         except Exception:
             pass
 
+    # ---------------- 跨机导出 / 导入
+
+    def on_export_sessions(self):
+        ids = [s for s in self.sel if s in self.tree_items]
+        if not ids:
+            self._dark_info("没选会话", ["先在列表里勾选要导出的会话。"])
+            return
+        chosen = [d for d in self.sessions if d["id"] in ids]
+        cloud = [d for d in chosen if d.get("transport") == "cloud"]
+        nofile = [d for d in chosen if not d.get("has_file")]
+        total = sum(max(d.get("size") or 0, 0) for d in chosen)
+        lines = ["将导出 %d 个会话（原始约 %s）。"
+                 % (len(chosen) - len(cloud), fmt_size(total))]
+        if cloud:
+            lines += ["", "其中 %d 个是云端会话，导不出来，会被跳过。" % len(cloud)]
+        if nofile:
+            lines += ["还有 %d 个找不到底稿，也会被跳过。" % len(nofile)]
+        lines += ["", "包里是完整聊天记录（可读文本），请自行保管。"]
+        if not self._dark_ask("导出会话", lines, ok_text="选择保存位置"):
+            return
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+        path = filedialog.asksaveasfilename(
+            title="保存会话包", defaultextension=SESS_PKG_EXT,
+            initialfile="会话导出-%s%s" % (ts, SESS_PKG_EXT),
+            filetypes=[("会话包", "*" + SESS_PKG_EXT), ("所有文件", "*.*")])
+        if not path:
+            return
+        self.log("开始导出 %d 个会话…" % len(ids))
+        threading.Thread(target=self._run_export, args=(ids, path), daemon=True).start()
+
+    def _run_export(self, ids, path):
+        try:
+            n, skipped, raw = export_sessions(ids, path, self.log)
+            if n == 0:
+                det = ["没有可导出的会话。"]
+                for t, why in skipped[:8]:
+                    det.append("  · %s — %s" % (t, why))
+                self.root.after(0, lambda d=det: self._dark_warn("一个都没导出来", d))
+                return
+            lines = ["已导出 %d 个会话（原始 %s）。" % (n, fmt_size(raw)),
+                     "", "保存位置：", path, "",
+                     "在新电脑上打开本工具 → 会话迁移页 → 「导入会话包…」。"]
+            if skipped:
+                lines += ["", "跳过 %d 个：" % len(skipped)]
+                for t, why in skipped[:6]:
+                    lines.append("  · %s — %s" % (t, why))
+                if len(skipped) > 6:
+                    lines.append("  …等共 %d 个，详见日志" % len(skipped))
+            self.root.after(0, lambda l=lines: self._dark_info("导出完成", l))
+        except Exception as e:
+            msg = str(e)
+            self.log("导出失败：%s" % msg)
+            self.root.after(0, lambda m=msg: self._dark_error("导出失败", [m]))
+
+    def on_import_sessions(self):
+        if app_running():
+            self._dark_error("先退出 WorkBuddy",
+                             ["导入要写数据库，可 WorkBuddy 还在运行。",
+                              "请先完全退出（也可以点右上角「退出 WorkBuddy」），再来导入。"])
+            return
+        target = self.target_uid()
+        if not target:
+            self._dark_error("没选目标账号",
+                             ["导入的会话要归到某个账号名下。",
+                              "请先在上面「目标账号」里选一个。"])
+            return
+        path = filedialog.askopenfilename(
+            title="选择会话包",
+            filetypes=[("会话包", "*" + SESS_PKG_EXT), ("所有文件", "*.*")])
+        if not path:
+            return
+        if not self._dark_ask("导入会话", [
+                "包：%s" % os.path.basename(path),
+                "归到：%s" % self.target_var.get(), "",
+                "会按包里记录的路径在新电脑上建同名目录，",
+                "并把聊天底稿还原到 WorkBuddy 的 projects 目录。",
+                "导入前自动备份数据库。继续吗？"]):
+            return
+        self.log("开始导入 %s → %s" % (os.path.basename(path), self.target_var.get()))
+        threading.Thread(target=self._run_import, args=(path, target), daemon=True).start()
+
+    def _run_import(self, path, target):
+        try:
+            bdir, n = backup_db("导入会话前")
+            self.log("已备份数据库（%d 个文件）→ %s" % (n, bdir))
+            r = import_sessions(path, target, self.log)
+            lines = ["成功导入 %d 个会话。" % len(r["ok"])]
+            if r["warnings"]:
+                lines += ["", "注意："]
+                for w in r["warnings"][:8]:
+                    lines.append("  · " + w)
+                if len(r["warnings"]) > 8:
+                    lines.append("  …另有 %d 条，见日志" % (len(r["warnings"]) - 8))
+            if r["skipped"]:
+                lines += ["", "跳过 %d 个：" % len(r["skipped"])]
+                for t, why in r["skipped"][:6]:
+                    lines.append("  · %s — %s" % (t, why))
+            lines += ["", "接下来：打开 WorkBuddy，切到目标账号，",
+                      "会话列表里就能看到，点开可以接着聊。"]
+            self.root.after(0, lambda l=lines: self._dark_info("导入完成", l))
+        except Exception as e:
+            msg = str(e)
+            self.log("导入失败：%s\n%s" % (msg, traceback.format_exc()))
+            self.root.after(0, lambda m=msg: self._dark_error(
+                "导入失败", [m, "", "数据库已先备份，没有受损。"]))
+        finally:
+            self.root.after(0, self.refresh_all)
+
     # ---------------- 执行迁移
 
     def on_go(self):
@@ -3534,7 +3905,7 @@ class App(object):
 
 
 HELP_TEXT = """\
-WorkBaby 账号及会话管理助手 · 使用说明（v3.12）
+WorkBaby 账号及会话管理助手 · 使用说明（v3.13）
 ===============================================
 
 工具位置：本文件（使用说明.txt / exe）所在的那个文件夹
@@ -3566,7 +3937,8 @@ WorkBaby 账号及会话管理助手 · 使用说明（v3.12）
               “导出全部账号（加密）/ 从备份文件导入”（见第八节）。
   · 用量统计 —— 积分消耗、Token 用量、每日柱状图、账号排行、模型排行、
                 模型限流与预计解封时间（见第八节）。
-  · 会话迁移 —— 会话的迁移 / 复制，以及定时任务过户。
+  · 会话迁移 —— 会话的迁移 / 复制、定时任务过户，以及换电脑时把某条会话
+                导出带走（见第十一节）。
   · 日志     —— 本次与历史的操作记录。
 
 一句话：会话能搬家，账号能一键换，用量能看清。
@@ -3763,9 +4135,37 @@ WorkBaby账号及会话管理助手_v<版本>.exe 输出到本文件夹。
 都放在 exe 同一个文件夹里，换 exe 不影响这些数据。
 
 
-十一、文件清单
+十一、跨机带走某条会话（导出 / 导入）
+------------------------------------
+换电脑时，想把某一条会话也带过去：
+
+  1) 老电脑：会话迁移页 → 勾选会话 → “导出勾选的会话…”，存成 .wbsession 文件
+     （导出只读文件，不用退出 WorkBuddy）
+  2) 把 .wbsession 拷到新电脑（U 盘、网盘都行）
+  3) 新电脑：装好 WorkBuddy 并登录一次 → 打开本工具 → 会话迁移页
+     → 先选好“目标账号” → 点“导入会话包…” → 选那个文件
+     （导入要写数据库，必须先完全退出 WorkBuddy）
+  4) 打开 WorkBuddy，切到目标账号，会话就在列表里，点开可以接着聊
+
+一条会话在硬盘上其实是三样东西，导出时三样都带走：
+  · 数据库里的一行（标题、所属账号、工作目录、模型、权限模式…）
+  · 聊天底稿   <会话ID>.jsonl
+  · 附属文件   <会话ID>.file-rollback.ndjson 和 <会话ID>\\ 目录（产物、附件、截图）
+
+几个必须知道的点：
+  · 包里是完整聊天记录（明文可读），别外传、别传公开链接。
+    但它不含任何登录凭证，别人拿到也登不了你的号。
+  · 云端会话（传输=cloud）导不出来：本地只有索引，内容在服务器上。
+  · 导入时会按包里记录的路径在新电脑上建同名空目录（例如
+    E:\\QoderWork工作区\\课程表）。那台机器没有 E 盘时会提示建不出来，
+    但会话照样导入，只是打开时工作目录是空的。
+  · 同一条会话导入两次会得到两份（第二份 ID 不同，等于副本），不会覆盖。
+  · 聊天里引用过的绝对路径附件，换机后可能打不开（文字内容不受影响）。
+
+
+十二、文件清单
 --------------
-WorkBaby账号及会话管理助手_v3.12.exe
+WorkBaby账号及会话管理助手_v3.13.exe
                    独立程序（打包好了，双击即用，不用装 Python）
 账号互通工具.py    主程序源码（Python + 图形界面，只用了系统自带组件）
 打包exe.py         重新打包脚本（自动按版本号命名输出 exe）
