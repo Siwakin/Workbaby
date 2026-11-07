@@ -57,7 +57,7 @@
 ## 运行环境
 
 - Windows 10 / 11
-- **免安装**：从本仓库 [Releases](../../releases) 下载 `WorkBaby账号及会话管理助手_v3.16.exe` 双击运行（exe 体积 11 MB，不进 Git 仓库）
+- **免安装**：从本仓库 [Releases](../../releases/latest) 下载 `WorkBaby账号及会话管理助手_v<版本>.exe`（当前源码对应 **v3.16**）双击运行；exe 体积约 11 MB，不进 Git 仓库
 - **源码运行**：Python 3.9+（**只用标准库**，不需要 pip 安装任何东西）
 
 ## 会话跨机搬走
