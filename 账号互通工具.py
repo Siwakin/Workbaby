@@ -48,6 +48,7 @@ import json
 import uuid
 import stat
 import math
+import queue
 import shutil
 import sqlite3
 import zipfile
@@ -91,7 +92,13 @@ except Exception:                                    # pragma: no cover
 APP_TITLE = "WorkBaby 账号及会话管理助手"
 # ★ 版本号规则（2026-10-26 用户约定）：小更新末位 +1 → v3.02、v3.03 …
 #   大改版才跳到 v4.0。exe 文件名同步带这个号，便于区分新旧。
-APP_VER = "v3.13"
+APP_VER = "v3.16"
+
+# ★ v3.16：退出按钮倒计时的「最短可见时长」（秒）。
+#   换电脑后 WorkBuddy 可能被 taskkill 瞬间关掉，退出流程 0.3 秒就结束；
+#   若立刻复位按钮，用户根本看不到倒计时（实测可见 0.29s / 0.00s）。
+#   提前结束时倒计时继续按墙钟显示到这个时长再复位。
+QUIT_CD_MIN_SHOW = 2.5
 
 # ---- 界面配色（科技风 · 冷黑底 + 青色冷光，v3.05 重新校准）
 #
@@ -929,8 +936,155 @@ def do_move_automation(ids, target, log):
 
 # ---------------------------------------------------------------- 自动登录：快照保存/回装/启动
 
+def _wb_exe_override():
+    """用户手动指定的路径（跨机器/非标准安装兜底）。
+
+    优先顺序：tool-config.json 的 wb_exe_path → 同级 wb_exe_path.txt /
+    WorkBuddy路径.txt（每行一个路径）。命中且文件存在即返回。"""
+    try:
+        import json
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            v = json.load(f).get("wb_exe_path")
+        if v and os.path.exists(v):
+            return v
+    except Exception:
+        pass
+    for fn in ("wb_exe_path.txt", "WorkBuddy路径.txt"):
+        p = os.path.join(TOOL_DIR, fn)
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip().strip('"').strip("'")
+                        if line and os.path.exists(line):
+                            return line
+        except Exception:
+            pass
+    return ""
+
+
+def _scan_uninstall_registry():
+    """从卸载项反查 WorkBuddy 安装位置（NSIS/MSI 安装都写这里）。
+
+    覆盖 HKLM/HKCU × 原生/WOW6432Node 四个视图。"""
+    try:
+        import winreg
+    except Exception:
+        return ""
+    bases = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    for root, base in bases:
+        try:
+            with winreg.OpenKey(root, base) as k:
+                cnt = winreg.QueryInfoKey(k)[0]
+                for i in range(cnt):
+                    name = winreg.EnumKey(k, i)
+                    try:
+                        with winreg.OpenKey(k, name) as sk:
+                            try:
+                                disp = winreg.QueryValueEx(sk, "DisplayName")[0]
+                            except Exception:
+                                disp = ""
+                            if not disp or "workbuddy" not in disp.lower():
+                                continue
+                            try:
+                                loc = winreg.QueryValueEx(sk, "InstallLocation")[0]
+                            except Exception:
+                                loc = ""
+                            if loc and os.path.exists(os.path.join(loc, "WorkBuddy.exe")):
+                                return os.path.join(loc, "WorkBuddy.exe")
+                            try:
+                                icon = winreg.QueryValueEx(sk, "DisplayIcon")[0]
+                            except Exception:
+                                icon = ""
+                            if icon:
+                                icon = icon.split(",")[0].strip().strip('"')
+                                if icon and os.path.exists(icon):
+                                    return icon
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return ""
+
+
+def _scan_startmenu_lnk():
+    """从开始菜单快捷方式解析 WorkBuddy.exe 的真实路径。"""
+    ps = (
+        '$sh = New-Object -ComObject WScript.Shell;'
+        '$dirs = @("$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs",'
+        ' "$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs");'
+        'foreach ($d in $dirs) {'
+        '  if (Test-Path $d) {'
+        '    Get-ChildItem $d -Recurse -Filter *.lnk -ErrorAction SilentlyContinue'
+        '      | ForEach-Object {'
+        '      try { $t = $sh.CreateShortcut($_.FullName).TargetPath } catch { return }'
+        '      if ($t -and $t -match \'WorkBuddy\\.exe$\') { $t }'
+        '    }'
+        '  }'
+        '}'
+    )
+    out = run_hidden(["powershell", "-NoProfile", "-NoLogo", "-Command", ps],
+                    timeout=25, encoding="utf-8")
+    if out and out.stdout:
+        for line in out.stdout.splitlines():
+            line = line.strip().strip('"')
+            if line and os.path.exists(line):
+                return line
+    return ""
+
+
+def _scan_common_dirs():
+    """在常见安装根目录浅扫 WorkBuddy.exe（不递归，毫秒级）。"""
+    roots = []
+    for env in ("LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+                "ProgramFiles(x86)", "ALLUSERSPROFILE"):
+        v = os.environ.get(env)
+        if v:
+            roots.append(v)
+    for d in "CDEFGH":
+        try:
+            if not os.path.exists("%s:\\" % d):
+                continue
+        except Exception:
+            continue
+        for sub in ("", " (x86)"):
+            roots.append("%s:\\Program Files%s" % (d, sub))
+    seen = set()
+    for r in roots:
+        r = os.path.expandvars(r)
+        if not r or r in seen:
+            continue
+        seen.add(r)
+        for cand in (os.path.join(r, "WorkBuddy", "WorkBuddy.exe"),
+                    os.path.join(r, "WorkBuddy.exe")):
+            if os.path.exists(cand):
+                return cand
+    return ""
+
+
+_WB_EXE_CACHE = None
+
+
 def find_wb_exe():
-    """定位 WorkBuddy.exe：①运行中进程 ②注册表 App Paths ③常见安装路径。"""
+    """定位 WorkBuddy.exe（跨机器 / 非标准安装也能找到）。
+
+    探测顺序：① 手动指定 ② 运行中进程 ③ 注册表 App Paths
+    ④ 卸载注册表 ⑤ 开始菜单快捷方式 ⑥ 常见目录浅扫。命中即返回，全失败返回 ""。
+    结果带存在性校验后缓存，避免每次切换账号都全盘扫描。"""
+    global _WB_EXE_CACHE
+    if _WB_EXE_CACHE and os.path.exists(_WB_EXE_CACHE):
+        return _WB_EXE_CACHE
+    # ① 手动兜底（跨机器最稳）
+    ov = _wb_exe_override()
+    if ov:
+        _WB_EXE_CACHE = ov
+        return ov
+    # ② 运行中进程
     try:
         ps = ('Get-CimInstance Win32_Process -Filter "Name=\'WorkBuddy.exe\'" '
               '| Select-Object -First 1 -ExpandProperty ExecutablePath')
@@ -938,26 +1092,39 @@ def find_wb_exe():
                          timeout=25, encoding="utf-8")
         first = (out.stdout or "").strip().splitlines() if out else []
         if first and os.path.exists(first[0].strip()):
-            return first[0].strip()
+            _WB_EXE_CACHE = first[0].strip()
+            return _WB_EXE_CACHE
     except Exception:
         pass
+    # ③ 注册表 App Paths
     try:
         import winreg
-        for root in (winreg.HKLM, winreg.HKCU):
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
             try:
                 with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\App Paths\WorkBuddy.exe") as k:
                     p, _ = winreg.QueryValueEx(k, None)
                     if p and os.path.exists(p):
+                        _WB_EXE_CACHE = p
                         return p
             except Exception:
                 pass
     except Exception:
         pass
-    for p in (r"D:\Program Files\WorkBuddy\WorkBuddy.exe",
-              r"C:\Program Files\WorkBuddy\WorkBuddy.exe",
-              os.path.expandvars(r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe")):
-        if os.path.exists(p):
-            return p
+    # ④ 卸载注册表
+    r = _scan_uninstall_registry()
+    if r:
+        _WB_EXE_CACHE = r
+        return r
+    # ⑤ 开始菜单快捷方式
+    r = _scan_startmenu_lnk()
+    if r:
+        _WB_EXE_CACHE = r
+        return r
+    # ⑥ 常见目录浅扫
+    r = _scan_common_dirs()
+    if r:
+        _WB_EXE_CACHE = r
+        return r
     return ""
 
 
@@ -1617,6 +1784,16 @@ class App(object):
         self._closing = False
         self._suppress_until = 0.0
         self._auto_busy = False
+        # v3.15：线程安全的 UI 调度队列。后台线程只往队列投递回调，
+        # 绝不在子线程里直接调 root.after / 操作 Tk 控件。
+        self._ui_queue = queue.Queue()
+        # v3.16：倒计时状态（墙钟）+ 泵看门狗用的上次绘制时刻
+        self._quit_cd_token = 0
+        self._quit_cd_started = 0.0
+        self._quit_cd_end = 0.0
+        self._quit_cd_total = 12.0
+        self._last_cd_paint = 0.0
+        self.root.after(50, self._pump_ui)
 
         self._build_ui()
         self._load_log_tail()
@@ -1801,6 +1978,59 @@ class App(object):
         except Exception:
             pass
 
+    # ---------------- 线程安全的 UI 调度（v3.15）
+    def _ui_call(self, fn, *args, **kw):
+        """把 fn 排到主线程执行，供后台线程安全调用。
+
+        ★ 从子线程直接调 root.after 会抛
+          RuntimeError: main thread is not in main loop
+        （PyInstaller 打包的 Tcl 运行时、模态框切换、线程锁竞争时都可能触发）。
+        一旦抛出，整条后台工作线程当场终止 —— 倒计时、退出流程全都不执行。
+        这里改成投递队列，由主线程常驻泵取出执行，子线程不再碰 Tk。
+        """
+        q = getattr(self, "_ui_queue", None)
+        if q is None:                       # 构造早期的兜底
+            try:
+                self.root.after(0, lambda: fn(*args, **kw))
+            except Exception:
+                pass
+            return
+        q.put((fn, args, kw))
+
+    def _pump_ui(self):
+        """主线程常驻泵：取出队列里的回调逐个执行（50ms 一轮）。"""
+        if getattr(self, "_closing", False):
+            return
+        try:
+            while True:
+                fn, args, kw = self._ui_queue.get_nowait()
+                try:
+                    fn(*args, **kw)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        # ★ v3.16 看门狗：倒计时不靠 _tick_quit_cd 的 after 链单独驱动。
+        #   50ms 常驻泵每 200ms 兜底刷新一次，即使 tick 链因异常中断、
+        #   或 PyInstaller 打包的 Tcl 丢弃某个 after 回调，按钮仍在走。
+        end = getattr(self, "_quit_cd_end", 0.0)
+        if end > time.time():
+            now = time.time()
+            if now - getattr(self, "_last_cd_paint", 0.0) >= 0.2:
+                self._last_cd_paint = now
+                try:
+                    self.header.set_quit_countdown(end - now,
+                                                   self._quit_cd_total)
+                except Exception:
+                    pass
+        if not getattr(self, "_closing", False):
+            try:
+                self.root.after(50, self._pump_ui)
+            except Exception:
+                pass
+
     def log(self, msg):
         write_log_line(msg)
 
@@ -1810,10 +2040,7 @@ class App(object):
                 self.logbox.see(tk.END)
             except Exception:
                 pass
-        try:
-            self.root.after(0, _do)
-        except Exception:
-            pass
+        self._ui_call(_do)
 
     # ---------------- 界面骨架
 
@@ -3292,61 +3519,113 @@ class App(object):
                 hint="Enter 确认  ·  Esc 取消"):
             return
 
+        # ★ v3.15：确认后在「主线程」立即启动；v3.16：并强制第一帧上屏。
+        self._start_quit_countdown(12)
+
         def work():
-            if not app_running():
-                self.root.after(0, self.refresh_all)
-                return
-            self.log("正在温柔退出 WorkBuddy（最多等 12 秒）……")
-            self.root.after(0, self._start_quit_countdown)
-            ok = quit_and_wait(timeout=12)
-            self.root.after(0, self._stop_quit_countdown)
-            if ok:
-                self.log("WorkBuddy 已退出")
-                self.root.after(0, self.refresh_all)
+            t0 = time.time()
+            running = app_running()
+            if not running:
+                self.log("WorkBuddy 当前未运行，无需退出")
+            else:
+                self.log("正在温柔退出 WorkBuddy（最多等 12 秒）……")
+            ok = quit_and_wait(timeout=12) if running else True
+            # ★ v3.16 诊断：退出流程耗时是决定倒计时能否被看见的关键变量。
+            #   换电脑后 taskkill 可能瞬间生效（0.3s），旧逻辑会立刻把按钮复位。
+            write_log_line("[倒计时] 退出流程耗时 %.2fs，起始 running=%s，结果=%s"
+                           % (time.time() - t0, running, ok))
+            if ok or not running:
+                if ok and running:
+                    self.log("WorkBuddy 已退出")
+                self._ui_call(self._stop_quit_countdown)
+                self._ui_call(self.refresh_all)
                 return
             self.log("温柔退出无效，自动强制退出")
-            self.root.after(0, lambda: self.header.set_quit_note("强制退出…"))
+            self._ui_call(self.header.set_quit_note, "强制退出…")
             force_quit_wb(self.log)
             for _ in range(10):
                 if not app_running():
                     break
                 time.sleep(0.5)
-            self.root.after(0, self._stop_quit_countdown)
-            self.root.after(0, self.refresh_all)
+            self._ui_call(self._stop_quit_countdown)
+            self._ui_call(self.refresh_all)
 
         threading.Thread(target=work, daemon=True).start()
 
-    # ---------------- 退出按钮上的 12 秒倒计时
+    # ---------------- 退出按钮上的 12 秒倒计时（v3.16 墙钟 + 看门狗）
 
     def _start_quit_countdown(self, total=12):
-        """点完「退出 WorkBuddy」，按钮立刻变成倒计时（按墙钟算，不受轮询节奏影响）。"""
-        self._quit_cd_token = getattr(self, "_quit_cd_token", 0) + 1
+        """确认后立即启动：主线程执行 + 首帧强制上屏 + 墙钟计时。"""
+        self._quit_cd_token += 1
+        token = self._quit_cd_token
         self._quit_cd_total = float(total)
-        self._quit_cd_end = time.time() + float(total)
-        self.header.set_quit_note("")
-        self._tick_quit_cd(self._quit_cd_token)
+        self._quit_cd_started = time.time()
+        self._quit_cd_end = self._quit_cd_started + float(total)
+        self._last_cd_paint = self._quit_cd_started
+        try:
+            self.header.set_quit_note("")
+            self.header.set_quit_countdown(float(total), float(total))
+            # 确认框刚销毁时，部分机器（DWM 合成 / 远程桌面 / exe 打包的 Tcl）
+            # 不会立刻重绘主窗口 → 强制把第一帧刷上屏，按钮当场变成「退出中 12s」。
+            self.root.update_idletasks()
+        except Exception as ex:
+            write_log_line("[倒计时] 首帧绘制失败：%s" % ex)
+        write_log_line("[倒计时] 启动 %.0fs（token=%d）" % (total, token))
+        self._tick_quit_cd(token)
 
     def _tick_quit_cd(self, token):
-        if token != getattr(self, "_quit_cd_token", 0) or self._closing:
+        if token != self._quit_cd_token or self._closing:
             return
         left = self._quit_cd_end - time.time()
         try:
             if left <= 0.02:
+                # 到点必须复位画面，否则按钮会停在最后一帧「退出中 1s」。
+                # 若 work() 已接力设置 note，_draw() 会优先显示「强制退出…」。
                 self.header.set_quit_countdown(0)
+                self._quit_cd_end = 0.0
                 return
             self.header.set_quit_countdown(left, self._quit_cd_total)
+            self._last_cd_paint = time.time()
             self.root.after(200, lambda t=token: self._tick_quit_cd(t))
-        except Exception:
-            pass
+        except Exception as ex:
+            # 不再静默吞掉：泵看门狗会继续刷新，同时留一行可查的记录。
+            write_log_line("[倒计时] tick 异常（由看门狗接管）：%s" % ex)
 
     def _stop_quit_countdown(self):
-        """WorkBuddy 已退出 / 强制退出做完 → 结束倒计时并把按钮恢复原样。"""
-        self._quit_cd_token = getattr(self, "_quit_cd_token", 0) + 1
+        """退出流程结束。
+
+        ★ v3.16：结束得太快时，倒计时继续按墙钟显示到 QUIT_CD_MIN_SHOW 再复位。
+          否则「功能正常、按钮一帧没变」——这正是换电脑后用户看到的现象。"""
+        token = self._quit_cd_token
+        # ★ 立刻作废旧 tick 链：停止请求之后，任何旧的 after 回调都不得再刷新按钮。
+        #   最短显示期内改由 50ms 泵看门狗按墙钟继续刷新。
+        self._quit_cd_token = token + 1
+        elapsed = time.time() - self._quit_cd_started
+        if (elapsed < QUIT_CD_MIN_SHOW and self.header._cd_left() > 0
+                and not self.header.quit_note):
+            wait = int((QUIT_CD_MIN_SHOW - elapsed) * 1000) + 20
+            write_log_line("[倒计时] 退出流程 %.2fs 提前结束，保留显示 %.1fs"
+                           % (elapsed, QUIT_CD_MIN_SHOW))
+            try:
+                self.root.after(wait, lambda t=self._quit_cd_token:
+                                self._stop_quit_countdown_force(t))
+            except Exception:
+                self._stop_quit_countdown_force(self._quit_cd_token)
+            return
+        self._stop_quit_countdown_force(self._quit_cd_token)
+
+    def _stop_quit_countdown_force(self, token):
+        if token != self._quit_cd_token:
+            return
+        self._quit_cd_token = token + 1
+        self._quit_cd_end = 0.0
         try:
             self.header.set_quit_countdown(0)
             self.header.set_quit_note("")
+            self.root.update_idletasks()
         except Exception:
             pass
+        write_log_line("[倒计时] 复位")
 
     # ---------------- 跨机导出 / 导入
 
@@ -4435,6 +4714,7 @@ class TechHeader(tk.Frame):
         self.quit_enabled = False
         # v3.07：点「退出 WorkBuddy」后按钮变成倒计时（剩下的秒数 + 收缩的进度条）
         self.quit_cd = 0.0          # 倒计时剩余秒数，0 = 没在倒计时
+        self.quit_cd_end = 0.0      # v3.16：墙钟绝对结束时刻，_draw() 据此重算剩余
         self.quit_cd_total = 12.0   # 总秒数（画进度条用）
         self.quit_note = ""         # 倒计时结束后接力的提示（如「强制退出…」）
         self.maxed = False
@@ -4472,11 +4752,22 @@ class TechHeader(tk.Frame):
 
     def set_quit_countdown(self, left, total=None):
         """按钮上显示倒计时。left>0 → 显示「退出中 Ns」+ 收缩进度条；
-        left<=0 → 恢复成「退出 WorkBuddy」。"""
+        left<=0 → 恢复成「退出 WorkBuddy」。
+
+        ★ v3.16：记的是「绝对结束时刻」而非剩余秒数快照。_draw() 每次按墙钟
+          重算，即使 tick 的 after 链意外中断，只要画布被任何路径重绘，
+          倒计时显示的仍是当前正确值（不会停在旧数字 / 直接消失）。"""
         if total:
             self.quit_cd_total = float(total)
         self.quit_cd = max(0.0, float(left))
+        self.quit_cd_end = time.time() + self.quit_cd if self.quit_cd > 0 else 0.0
         self._draw()
+
+    def _cd_left(self):
+        """当前真实剩余秒数（墙钟）。0 = 没在倒计时。"""
+        if self.quit_cd > 0 and self.quit_cd_end > 0:
+            return max(0.0, self.quit_cd_end - time.time())
+        return 0.0
 
     def set_quit_note(self, text):
         """倒计时结束后接力显示的一句话（如「强制退出…」）。"""
@@ -4486,7 +4777,7 @@ class TechHeader(tk.Frame):
     @property
     def quit_busy(self):
         """正在退出（倒计时中或已进入强制退出阶段）→ 按钮不再响应点击。"""
-        return bool(self.quit_cd > 0 or self.quit_note)
+        return bool(self._cd_left() > 0 or self.quit_note)
 
     # ---- 事件
     def _zones(self):
@@ -4568,6 +4859,7 @@ class TechHeader(tk.Frame):
     # ---- 绘制
     def _draw(self):
         cv = self.cv
+        cd_left = self._cd_left()      # v3.16：整帧统一用墙钟算出的剩余秒数
         cv.delete("all")
         w = cv.winfo_width() or 1000
         h = self.H
@@ -4638,9 +4930,9 @@ class TechHeader(tk.Frame):
                 continue
             if k == "quit":
                 en = self.quit_enabled
-                if self.quit_cd > 0:
+                if cd_left > 0:
                     # v3.07：倒计时态（青色描边，字用强调色）
-                    label = "退出中 %ds" % int(math.ceil(self.quit_cd))
+                    label = "退出中 %ds" % int(math.ceil(cd_left))
                     fill, line, fg = "#0b1620", C_ACC, C_ACC_TXT
                 elif self.quit_note:
                     # 温柔退出没成，进入强制退出阶段
@@ -4662,8 +4954,8 @@ class TechHeader(tk.Frame):
             # v3.10：原来是「内缩 4px 的直角矩形」塞在切角按钮里 —— 上下矮一截、
             # 四角还是直角，跟外框怎么都对不齐。改成贴着描边内侧（内缩 1px），
             # 左端跟着按钮一起切角，右端竖直平齐（填充中段本来就没有端头）。
-            if k == "quit" and self.quit_cd > 0 and self.quit_cd_total > 0:
-                frac = max(0.0, min(1.0, self.quit_cd / self.quit_cd_total))
+            if k == "quit" and cd_left > 0 and self.quit_cd_total > 0:
+                frac = max(0.0, min(1.0, cd_left / self.quit_cd_total))
                 # ★ 内缩 0.5 而不是 1：Tk 填充多边形是“像素中心在内才填”，
                 #   边界正好落在整数上会让最后一行像素漏掉（下沿露一条底色）。
                 bx0, bty, bby = x0 + 0.5, y0 + 0.5, y1 - 0.5
@@ -4925,9 +5217,41 @@ def main():
     install_frameless(root)         # 去系统标题栏（任务栏按钮保留）
     root.configure(bg=C_PAGE)
     apply_theme(root)
-    App(root)
+    app = App(root)
     root.deiconify()
+    # 内部自检入口：只有显式带参数才走，普通双击完全不受影响。
+    # 用途：在「打包后的 exe」里证明倒计时确实能画出来，且不触发任何退出动作。
+    if "--selftest-countdown" in sys.argv:
+        _selftest_countdown(root, app)
     root.mainloop()
+
+
+def _selftest_countdown(root, app):
+    """不碰 WorkBuddy，只启动一次倒计时，把按钮文字逐帧写进 倒计时自检.txt。"""
+    def btn_text():
+        cv = app.header.cv
+        for it in cv.find_all():
+            if cv.type(it) == "text":
+                t = cv.itemcget(it, "text")
+                if t.startswith("退出中") or t == "退出 WorkBuddy" or t == "强制退出…":
+                    return t
+        return ""
+
+    path = os.path.join(TOOL_DIR, "倒计时自检.txt")
+    lines = ["APP_VER=%s" % APP_VER]
+
+    def sample(i=0):
+        if i > 14:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\r\n".join(lines) + "\r\n")
+            except Exception:
+                pass
+            return
+        lines.append("t=%.2f text=%s" % (i * 0.25, btn_text()))
+        root.after(250, lambda: sample(i + 1))
+
+    root.after(400, lambda: (app._start_quit_countdown(3), sample()))
 
 
 if __name__ == "__main__":
